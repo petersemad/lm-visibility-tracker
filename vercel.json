@@ -6,8 +6,7 @@
   "crons": [
     {
       "path": "/api/run",
-      "schedule": "10 9 * * 1,4",
-      "timezone": "Africa/Cairo"
+      "schedule": "10 7 * * 1,4"
     }
   ]
 }
