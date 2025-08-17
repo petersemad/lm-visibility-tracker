@@ -1,0 +1,10 @@
+{
+  "name": "llm-visibility-tracker",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "googleapis": "^134.0.0",
+    "p-limit": "^5.0.0"
+  }
+}
