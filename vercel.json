@@ -2,11 +2,5 @@
   "functions": {
     "api/run.js": { "memory": 1024, "maxDuration": 60 },
     "api/test.js": { "memory": 256, "maxDuration": 30 }
-  },
-  "crons": [
-    {
-      "path": "/api/run",
-      "schedule": "10 7 * * 1,4"
-    }
-  ]
+  }
 }
