@@ -93,7 +93,11 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
   const needCol=(label)=>{ const i=header.indexOf(label); if(i===-1) need.push(label); else cols[label]=i+1; };
   needCol(`${dateKey}_results_normal`);
   needCol(`${dateKey}_analysis_normal`);
-  if(wantWeb){ needCol(`${dateKey}_results_web`); needCol(`${dateKey}_analysis_web`); }
+  if(wantWeb){
+    needCol(`${dateKey}_results_web`);
+    needCol(`${dateKey}_analysis_web`);
+    needCol(`${dateKey}_sources_web`); // NEW
+  }
   if(need.length){
     const start=header.length+1;
     await sheets.spreadsheets.values.update({
@@ -107,7 +111,7 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
   return cols;
 }
 
-/* ===== OpenAI with retries ===== */
+/* ===== OpenAI calls ===== */
 async function callChat(model, promptText){
   return withRetry(async () => {
     const r=await fetch("https://api.openai.com/v1/chat/completions",{
@@ -123,20 +127,72 @@ async function callChat(model, promptText){
     return d?.choices?.[0]?.message?.content || "";
   });
 }
+
+// Web run that forces JSON with sources
 async function callWeb(model, promptText){
   return withRetry(async () => {
     const r=await fetch("https://api.openai.com/v1/responses",{
       method:"POST",
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
       body:JSON.stringify({
-        model, input:promptText, tools:[{type:"web_search"}],
-        temperature:0.2, text:{ format:{type:"text"}, verbosity:"medium" }, tool_choice:"auto"
+        model,
+        tools:[{type:"web_search"}],
+        input: `${promptText}
+
+Return JSON with keys "answer" and "sources".
+"sources" must be 3 to 5 items actually used. Each item is { "url": "...", "title": "..." }.`,
+        temperature:0.2,
+        tool_choice:"auto",
+        response_format:{
+          type:"json_schema",
+          json_schema:{
+            name:"WebAnswer",
+            schema:{
+              type:"object",
+              additionalProperties:false,
+              required:["answer","sources"],
+              properties:{
+                answer:{ type:"string" },
+                sources:{
+                  type:"array",
+                  items:{
+                    type:"object",
+                    additionalProperties:false,
+                    required:["url"],
+                    properties:{
+                      url:{ type:"string", format:"uri" },
+                      title:{ type:"string" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
       })
     });
     if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-    const d=await r.json(); return sanitizeForSheet(extractResponsesText(d));
+    const d=await r.json();
+
+    // Try to read model JSON from Responses API
+    const raw = extractResponsesText(d);
+    let answer = raw;
+    let sources = [];
+
+    try {
+      const j = JSON.parse(raw);
+      answer = j?.answer ?? answer;
+      sources = Array.isArray(j?.sources) ? j.sources.map(s => s?.url).filter(Boolean) : [];
+    } catch {
+      // Fallback: grab any links from text if JSON failed
+      sources = extractUrlsFromText(raw);
+    }
+
+    return { text: sanitizeForSheet(answer), sources: dedupeAndNormalize(sources) };
   });
 }
+
+// Try to pull textual output from Responses API object
 function extractResponsesText(data){
   if(typeof data.output_text==="string" && data.output_text.trim()) return data.output_text;
   try{
@@ -161,6 +217,37 @@ function extractResponsesText(data){
   return "(no text extracted)";
 }
 
+/* ===== URL helpers ===== */
+function extractUrlsFromText(t){
+  if(!t) return [];
+  return (t.match(/https?:\/\/[^\s)\]>"']+/gi) || []);
+}
+function dedupeAndNormalize(arr){
+  const seen = new Set();
+  const out = [];
+  for(const raw of arr){
+    const u = normalizeUrl(raw);
+    if(!u) continue;
+    if(seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out.slice(0, 5);
+}
+function normalizeUrl(raw){
+  try{
+    const u = new URL(raw.trim());
+    u.hostname = u.hostname.toLowerCase().replace(/^www\./,"");
+    for(const k of [...u.searchParams.keys()]){
+      const kl = k.toLowerCase();
+      if(kl.startsWith("utm_") || kl==="gclid" || kl==="fbclid") u.searchParams.delete(k);
+    }
+    if(u.pathname !== "/" && u.pathname.endsWith("/")) u.pathname = u.pathname.replace(/\/+$/,"");
+    if(u.hash && u.hash.length <= 1) u.hash = "";
+    return u.toString();
+  }catch{ return null; }
+}
+
 /* ===== Handler: batched writes with retry ===== */
 export default async function handler(req, res){
   try{
@@ -177,8 +264,8 @@ export default async function handler(req, res){
     const tabBrands=String(settings.sheet_name_brands||"Brands");
     const tabWide=String(settings.sheet_name_wide||"Daily_Runs");
     const enableDual=String(settings.enable_dual_variant||"TRUE").toUpperCase()==="TRUE";
-    const concurrency=Math.max(1, Number(settings.chunk_size||10) || 10);   // parallel model calls
-    const FLUSH_EVERY = Math.max(5, Number(settings.flush_every||25) || 25); // rows per Sheets batch
+    const concurrency=Math.max(1, Number(settings.chunk_size||10) || 10);
+    const FLUSH_EVERY = Math.max(5, Number(settings.flush_every||25) || 25);
 
     const [prompts, brands]=await Promise.all([ readPrompts(sheets, tabPrompts), readBrands(sheets, tabBrands) ]);
     if(!prompts.length) return res.status(200).json({ ok:true, message:"No enabled prompts" });
@@ -189,8 +276,8 @@ export default async function handler(req, res){
     const cols=await getOrCreateDateCols(sheets, tabWide, dateKey, enableDual);
 
     // batching buffer
-    let pending = []; // array of {range, values}
-    async function flush(reason=""){
+    let pending = [];
+    async function flush(){
       if (!pending.length) return;
       const batch = pending.splice(0, pending.length);
       await withRetry(async () => {
@@ -215,23 +302,32 @@ export default async function handler(req, res){
           const normal=await callChat(model, p.text);
           const normalA=analyzeText(normal, brands, brandRegexes);
 
-          let web="", webA="";
+          let webText="", webSources=[], webA="";
           if(enableDual){
-            try{ web=await callWeb(model, p.text); }
-            catch(e){ web=`(error web) ${String(e)}`; }
-            webA=analyzeText(web, brands, brandRegexes);
+            try{
+              const webOut=await callWeb(model, p.text);
+              webText = webOut.text || "";
+              webSources = Array.isArray(webOut.sources) ? webOut.sources : [];
+            }catch(e){
+              webText = `(error web) ${String(e)}`;
+              webSources = dedupeAndNormalize(extractUrlsFromText(webText));
+            }
+            webA=analyzeText(webText, brands, brandRegexes);
           }
 
-          // queue changes rather than writing immediately
+          // queue writes
           pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_normal`])}`, values:[[normal]] });
           pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_normal`])}`, values:[[normalA]] });
           if(enableDual){
-            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_web`])}`, values:[[web]] });
+            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_web`])}`, values:[[webText]] });
             pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_web`])}`, values:[[webA]] });
+            if (cols[`${dateKey}_sources_web`]) {
+              pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_sources_web`])}`, values:[[ (webSources||[]).join("\n") ]] });
+            }
           }
 
           processed++;
-          if (processed % FLUSH_EVERY === 0) { await flush("periodic"); }
+          if (processed % FLUSH_EVERY === 0) { await flush(); }
         } catch(e){ errors.push(String(e)); }
         finally{ active--; runOne(); }
       };
@@ -239,8 +335,7 @@ export default async function handler(req, res){
       for(let k=0;k<N;k++) runOne();
     });
 
-    // final flush
-    await flush("final");
+    await flush();
 
     res.status(200).json({ ok:true, model, dual:enableDual, prompts:prompts.length, processed, errors });
   }catch(e){
