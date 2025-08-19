@@ -131,37 +131,39 @@ async function callChat(model, promptText){
 // Web run that forces JSON with sources
 async function callWeb(model, promptText){
   return withRetry(async () => {
-    const r=await fetch("https://api.openai.com/v1/responses",{
-      method:"POST",
-      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
-      body:JSON.stringify({
+    const r = await fetch("https://api.openai.com/v1/responses", {
+      method: "POST",
+      headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
         model,
         tools:[{type:"web_search"}],
         input: `${promptText}
 
 Return JSON with keys "answer" and "sources".
 "sources" must be 3 to 5 items actually used. Each item is { "url": "...", "title": "..." }.`,
-        temperature:0.2,
+        temperature: 0.2,
         tool_choice:"auto",
-        response_format:{
-          type:"json_schema",
-          json_schema:{
-            name:"WebAnswer",
-            schema:{
-              type:"object",
-              additionalProperties:false,
-              required:["answer","sources"],
-              properties:{
-                answer:{ type:"string" },
-                sources:{
-                  type:"array",
-                  items:{
-                    type:"object",
-                    additionalProperties:false,
-                    required:["url"],
-                    properties:{
-                      url:{ type:"string", format:"uri" },
-                      title:{ type:"string" }
+        text: {
+          format: {
+            type: "json_schema",
+            json_schema: {
+              name: "WebAnswer",
+              schema: {
+                type: "object",
+                additionalProperties: false,
+                required: ["answer","sources"],
+                properties: {
+                  answer: { type: "string" },
+                  sources: {
+                    type: "array",
+                    items: {
+                      type: "object",
+                      additionalProperties: false,
+                      required: ["url"],
+                      properties: {
+                        url: { type: "string", format: "uri" },
+                        title: { type: "string" }
+                      }
                     }
                   }
                 }
@@ -171,10 +173,10 @@ Return JSON with keys "answer" and "sources".
         }
       })
     });
-    if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-    const d=await r.json();
 
-    // Try to read model JSON from Responses API
+    if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+    const d = await r.json();
+
     const raw = extractResponsesText(d);
     let answer = raw;
     let sources = [];
@@ -184,7 +186,6 @@ Return JSON with keys "answer" and "sources".
       answer = j?.answer ?? answer;
       sources = Array.isArray(j?.sources) ? j.sources.map(s => s?.url).filter(Boolean) : [];
     } catch {
-      // Fallback: grab any links from text if JSON failed
       sources = extractUrlsFromText(raw);
     }
 
@@ -248,7 +249,7 @@ function normalizeUrl(raw){
   }catch{ return null; }
 }
 
-/* ===== Handler: batched writes with retry ===== */
+/* ===== Handler ===== */
 export default async function handler(req, res){
   try{
     for (const k of ["OPENAI_API_KEY","GOOGLE_CLIENT_EMAIL","SHEET_ID"]) {
