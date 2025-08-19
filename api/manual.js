@@ -145,9 +145,12 @@ Return JSON with keys "answer" and "sources".
         tool_choice:"auto",
         text: {
           format: {
+            // name is required at this level
+            name: "WebAnswer",
             type: "json_schema",
             json_schema: {
-              name: "WebAnswer",
+              // strict true makes the model obey the schema
+              strict: true,
               schema: {
                 type: "object",
                 additionalProperties: false,
@@ -156,6 +159,8 @@ Return JSON with keys "answer" and "sources".
                   answer: { type: "string" },
                   sources: {
                     type: "array",
+                    minItems: 1,
+                    maxItems: 5,
                     items: {
                       type: "object",
                       additionalProperties: false,
@@ -333,7 +338,7 @@ export default async function handler(req, res){
         finally{ active--; runOne(); }
       };
       const N=Math.max(1, Math.min(concurrency, prompts.length));
-      for(let k=0;k<N;k++) runOne();
+      for(let k=0;k>N;k++) runOne();
     });
 
     await flush();
