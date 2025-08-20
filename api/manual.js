@@ -103,7 +103,7 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
   if(wantWeb){
     needCol(`${dateKey}_results_web`);
     needCol(`${dateKey}_analysis_web`);
-    needCol(`${dateKey}_sources_web`); // NEW
+    needCol(`${dateKey}_sources_web`);
   }
   if(need.length){
     const start=header.length+1;
@@ -135,7 +135,7 @@ async function callChat(model, promptText){
   });
 }
 
-// Web run that forces JSON with sources, but times out fast
+// Web run with structured output and timeout
 async function callWeb(model, promptText){
   return withRetry(async () => {
     const r = await fetchWithTimeout("https://api.openai.com/v1/responses", {
@@ -152,28 +152,26 @@ Return JSON with keys "answer" and "sources".
         tool_choice:"auto",
         text: {
           format: {
+            // The Responses API expects schema here, not under json_schema
             name: "WebAnswer",
             type: "json_schema",
-            json_schema: {
-              strict: true,
-              schema: {
-                type: "object",
-                additionalProperties: false,
-                required: ["answer","sources"],
-                properties: {
-                  answer: { type: "string" },
-                  sources: {
-                    type: "array",
-                    minItems: 1,
-                    maxItems: 5,
-                    items: {
-                      type: "object",
-                      additionalProperties: false,
-                      required: ["url"],
-                      properties: {
-                        url: { type: "string", format: "uri" },
-                        title: { type: "string" }
-                      }
+            schema: {
+              type: "object",
+              additionalProperties: false,
+              required: ["answer","sources"],
+              properties: {
+                answer: { type: "string" },
+                sources: {
+                  type: "array",
+                  minItems: 1,
+                  maxItems: 5,
+                  items: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["url"],
+                    properties: {
+                      url: { type: "string", format: "uri" },
+                      title: { type: "string" }
                     }
                   }
                 }
@@ -203,7 +201,7 @@ Return JSON with keys "answer" and "sources".
   }, { tries: 2, base: 300, factor: 2 });
 }
 
-// Try to pull textual output from Responses API object
+// Pull text from Responses API object
 function extractResponsesText(data){
   if(typeof data.output_text==="string" && data.output_text.trim()) return data.output_text;
   try{
@@ -276,7 +274,7 @@ export default async function handler(req, res){
     const tabWide=String(settings.sheet_name_wide||"Daily_Runs");
     const enableDual=String(settings.enable_dual_variant||"TRUE").toUpperCase()==="TRUE";
 
-    // keep it gentle to avoid stalls
+    // gentle to avoid stalls
     const concurrency = Math.max(1, Math.min(2, Number(settings.chunk_size||2) || 2));
 
     const [prompts, brands]=await Promise.all([ readPrompts(sheets, tabPrompts), readBrands(sheets, tabBrands) ]);
@@ -288,7 +286,6 @@ export default async function handler(req, res){
     const cols=await getOrCreateDateCols(sheets, tabWide, dateKey, enableDual);
 
     async function writeRow(row, updates){
-      // updates is an object of { colLabel: value }
       const data = Object.entries(updates).map(([label, value]) => {
         const c = cols[label];
         if (!c) return null;
@@ -303,7 +300,7 @@ export default async function handler(req, res){
       });
     }
 
-    // process with small pool and flush per row
+    // process with small pool and write per row
     let i=0, active=0, errors=[];
     const next=()=> i<prompts.length ? i++ : -1;
 
