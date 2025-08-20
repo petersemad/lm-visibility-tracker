@@ -16,28 +16,21 @@ const GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY_B64
 
 /* ===== Small utils ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
-async function withRetry(fn, { tries = 3, base = 300, factor = 2 } = {}) {
+async function withRetry(fn, { tries = 5, base = 400, factor = 2 } = {}) {
   let attempt = 0, lastErr;
   while (attempt < tries) {
     try { return await fn(); }
     catch (e) {
       lastErr = e;
-      const msg = String(e || "");
-      const retriable = /429|5\d\d|quota|Rate limit|upstream connect error|timeout/i.test(msg);
+      const msg = String(e);
+      const retriable = /429|5\d\d|quota|Rate limit|upstream connect error/i.test(msg);
       if (!retriable || attempt === tries - 1) throw e;
-      const delay = Math.round(base * Math.pow(factor, attempt) + Math.random() * 150);
+      const delay = Math.round(base * Math.pow(factor, attempt) + Math.random() * 200);
       await sleep(delay);
       attempt++;
     }
   }
   throw lastErr;
-}
-
-function fetchWithTimeout(url, opts = {}, timeoutMs = 25000) {
-  const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(new Error("timeout")), timeoutMs);
-  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
 const A1 = (r, c) => `${colName(c)}${r}`;
@@ -100,11 +93,7 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
   const needCol=(label)=>{ const i=header.indexOf(label); if(i===-1) need.push(label); else cols[label]=i+1; };
   needCol(`${dateKey}_results_normal`);
   needCol(`${dateKey}_analysis_normal`);
-  if(wantWeb){
-    needCol(`${dateKey}_results_web`);
-    needCol(`${dateKey}_analysis_web`);
-    needCol(`${dateKey}_sources_web`);
-  }
+  if(wantWeb){ needCol(`${dateKey}_results_web`); needCol(`${dateKey}_analysis_web`); }
   if(need.length){
     const start=header.length+1;
     await sheets.spreadsheets.values.update({
@@ -118,90 +107,36 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
   return cols;
 }
 
-/* ===== OpenAI calls ===== */
+/* ===== OpenAI with retries ===== */
 async function callChat(model, promptText){
   return withRetry(async () => {
-    const r=await fetchWithTimeout("https://api.openai.com/v1/chat/completions",{
+    const r=await fetch("https://api.openai.com/v1/chat/completions",{
       method:"POST",
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
       body:JSON.stringify({
         model, temperature:0.2,
         messages:[ {role:"system",content:"Answer concisely. Plain text only."}, {role:"user",content:promptText} ]
       })
-    }, 20000);
+    });
     if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
     const d=await r.json();
     return d?.choices?.[0]?.message?.content || "";
   });
 }
-
-// Web run with structured output and timeout
 async function callWeb(model, promptText){
   return withRetry(async () => {
-    const r = await fetchWithTimeout("https://api.openai.com/v1/responses", {
-      method: "POST",
-      headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        tools:[{type:"web_search"}],
-        input: `${promptText}
-
-Return JSON with keys "answer" and "sources".
-"sources" must be 3 to 5 items actually used. Each item is { "url": "...", "title": "..." }.`,
-        temperature: 0.2,
-        tool_choice:"auto",
-        text: {
-          format: {
-            // The Responses API expects schema here, not under json_schema
-            name: "WebAnswer",
-            type: "json_schema",
-            schema: {
-              type: "object",
-              additionalProperties: false,
-              required: ["answer","sources"],
-              properties: {
-                answer: { type: "string" },
-                sources: {
-                  type: "array",
-                  minItems: 1,
-                  maxItems: 5,
-                  items: {
-                    type: "object",
-                    additionalProperties: false,
-                    required: ["url"],
-                    properties: {
-                      url: { type: "string", format: "uri" },
-                      title: { type: "string" }
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
+    const r=await fetch("https://api.openai.com/v1/responses",{
+      method:"POST",
+      headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
+      body:JSON.stringify({
+        model, input:promptText, tools:[{type:"web_search"}],
+        temperature:0.2, text:{ format:{type:"text"}, verbosity:"medium" }, tool_choice:"auto"
       })
-    }, 25000);
-
-    if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-    const d = await r.json();
-
-    const raw = extractResponsesText(d);
-    let answer = raw;
-    let sources = [];
-
-    try {
-      const j = JSON.parse(raw);
-      answer = j?.answer ?? answer;
-      sources = Array.isArray(j?.sources) ? j.sources.map(s => s?.url).filter(Boolean) : [];
-    } catch {
-      sources = extractUrlsFromText(raw);
-    }
-
-    return { text: sanitizeForSheet(answer), sources: dedupeAndNormalize(sources) };
-  }, { tries: 2, base: 300, factor: 2 });
+    });
+    if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+    const d=await r.json(); return sanitizeForSheet(extractResponsesText(d));
+  });
 }
-
-// Pull text from Responses API object
 function extractResponsesText(data){
   if(typeof data.output_text==="string" && data.output_text.trim()) return data.output_text;
   try{
@@ -226,38 +161,7 @@ function extractResponsesText(data){
   return "(no text extracted)";
 }
 
-/* ===== URL helpers ===== */
-function extractUrlsFromText(t){
-  if(!t) return [];
-  return (t.match(/https?:\/\/[^\s)\]>"']+/gi) || []);
-}
-function dedupeAndNormalize(arr){
-  const seen = new Set();
-  const out = [];
-  for(const raw of arr){
-    const u = normalizeUrl(raw);
-    if(!u) continue;
-    if(seen.has(u)) continue;
-    seen.add(u);
-    out.push(u);
-  }
-  return out.slice(0, 5);
-}
-function normalizeUrl(raw){
-  try{
-    const u = new URL(raw.trim());
-    u.hostname = u.hostname.toLowerCase().replace(/^www\./,"");
-    for(const k of [...u.searchParams.keys()]){
-      const kl = k.toLowerCase();
-      if(kl.startsWith("utm_") || kl==="gclid" || kl==="fbclid") u.searchParams.delete(k);
-    }
-    if(u.pathname !== "/" && u.pathname.endsWith("/")) u.pathname = u.pathname.replace(/\/+$/,"");
-    if(u.hash && u.hash.length <= 1) u.hash = "";
-    return u.toString();
-  }catch{ return null; }
-}
-
-/* ===== Handler ===== */
+/* ===== Handler: batched writes with retry ===== */
 export default async function handler(req, res){
   try{
     for (const k of ["OPENAI_API_KEY","GOOGLE_CLIENT_EMAIL","SHEET_ID"]) {
@@ -273,9 +177,8 @@ export default async function handler(req, res){
     const tabBrands=String(settings.sheet_name_brands||"Brands");
     const tabWide=String(settings.sheet_name_wide||"Daily_Runs");
     const enableDual=String(settings.enable_dual_variant||"TRUE").toUpperCase()==="TRUE";
-
-    // gentle to avoid stalls
-    const concurrency = Math.max(1, Math.min(2, Number(settings.chunk_size||2) || 2));
+    const concurrency=Math.max(1, Number(settings.chunk_size||10) || 10);   // parallel model calls
+    const FLUSH_EVERY = Math.max(5, Number(settings.flush_every||25) || 25); // rows per Sheets batch
 
     const [prompts, brands]=await Promise.all([ readPrompts(sheets, tabPrompts), readBrands(sheets, tabBrands) ]);
     if(!prompts.length) return res.status(200).json({ ok:true, message:"No enabled prompts" });
@@ -285,23 +188,21 @@ export default async function handler(req, res){
     const dateKey=todayKey("Africa/Cairo");
     const cols=await getOrCreateDateCols(sheets, tabWide, dateKey, enableDual);
 
-    async function writeRow(row, updates){
-      const data = Object.entries(updates).map(([label, value]) => {
-        const c = cols[label];
-        if (!c) return null;
-        return { range:`${tabWide}!${A1(row, c)}`, values:[[ value ?? "" ]] };
-      }).filter(Boolean);
-      if (!data.length) return;
+    // batching buffer
+    let pending = []; // array of {range, values}
+    async function flush(reason=""){
+      if (!pending.length) return;
+      const batch = pending.splice(0, pending.length);
       await withRetry(async () => {
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId:SHEET_ID,
-          requestBody:{ valueInputOption:"RAW", data }
+          requestBody:{ valueInputOption:"RAW", data: batch }
         });
       });
     }
 
-    // process with small pool and write per row
-    let i=0, active=0, errors=[];
+    // pool
+    let i=0, active=0, processed=0, errors=[];
     const next=()=> i<prompts.length ? i++ : -1;
 
     await new Promise(resolve=>{
@@ -314,37 +215,34 @@ export default async function handler(req, res){
           const normal=await callChat(model, p.text);
           const normalA=analyzeText(normal, brands, brandRegexes);
 
-          await writeRow(row, {
-            [`${dateKey}_results_normal`]: normal,
-            [`${dateKey}_analysis_normal`]: normalA
-          });
-
+          let web="", webA="";
           if(enableDual){
-            let webText="", webSources=[], webA="";
-            try{
-              const webOut=await callWeb(model, p.text);
-              webText = webOut.text || "";
-              webSources = Array.isArray(webOut.sources) ? webOut.sources : [];
-            }catch(e){
-              webText = `(error web) ${String(e)}`;
-              webSources = dedupeAndNormalize(extractUrlsFromText(webText));
-            }
-            webA=analyzeText(webText, brands, brandRegexes);
-
-            await writeRow(row, {
-              [`${dateKey}_results_web`]: webText,
-              [`${dateKey}_analysis_web`]: webA,
-              [`${dateKey}_sources_web`]: (webSources||[]).join("\n")
-            });
+            try{ web=await callWeb(model, p.text); }
+            catch(e){ web=`(error web) ${String(e)}`; }
+            webA=analyzeText(web, brands, brandRegexes);
           }
+
+          // queue changes rather than writing immediately
+          pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_normal`])}`, values:[[normal]] });
+          pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_normal`])}`, values:[[normalA]] });
+          if(enableDual){
+            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_web`])}`, values:[[web]] });
+            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_web`])}`, values:[[webA]] });
+          }
+
+          processed++;
+          if (processed % FLUSH_EVERY === 0) { await flush("periodic"); }
         } catch(e){ errors.push(String(e)); }
         finally{ active--; runOne(); }
       };
-      const N = Math.max(1, Math.min(concurrency, prompts.length));
+      const N=Math.max(1, Math.min(concurrency, prompts.length));
       for(let k=0;k<N;k++) runOne();
     });
 
-    res.status(200).json({ ok:true, model, dual:enableDual, prompts:prompts.length });
+    // final flush
+    await flush("final");
+
+    res.status(200).json({ ok:true, model, dual:enableDual, prompts:prompts.length, processed, errors });
   }catch(e){
     console.error(e);
     res.status(500).json({ ok:false, error:String(e) });
