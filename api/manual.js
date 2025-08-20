@@ -16,21 +16,28 @@ const GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY_B64
 
 /* ===== Small utils ===== */
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-async function withRetry(fn, { tries = 5, base = 400, factor = 2 } = {}) {
+
+async function withRetry(fn, { tries = 3, base = 300, factor = 2 } = {}) {
   let attempt = 0, lastErr;
   while (attempt < tries) {
     try { return await fn(); }
     catch (e) {
       lastErr = e;
-      const msg = String(e);
-      const retriable = /429|5\d\d|quota|Rate limit|upstream connect error/i.test(msg);
+      const msg = String(e || "");
+      const retriable = /429|5\d\d|quota|Rate limit|upstream connect error|timeout/i.test(msg);
       if (!retriable || attempt === tries - 1) throw e;
-      const delay = Math.round(base * Math.pow(factor, attempt) + Math.random() * 200);
+      const delay = Math.round(base * Math.pow(factor, attempt) + Math.random() * 150);
       await sleep(delay);
       attempt++;
     }
   }
   throw lastErr;
+}
+
+function fetchWithTimeout(url, opts = {}, timeoutMs = 25000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(new Error("timeout")), timeoutMs);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(t));
 }
 
 const A1 = (r, c) => `${colName(c)}${r}`;
@@ -114,24 +121,24 @@ async function getOrCreateDateCols(sheets, tab, dateKey, wantWeb){
 /* ===== OpenAI calls ===== */
 async function callChat(model, promptText){
   return withRetry(async () => {
-    const r=await fetch("https://api.openai.com/v1/chat/completions",{
+    const r=await fetchWithTimeout("https://api.openai.com/v1/chat/completions",{
       method:"POST",
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
       body:JSON.stringify({
         model, temperature:0.2,
         messages:[ {role:"system",content:"Answer concisely. Plain text only."}, {role:"user",content:promptText} ]
       })
-    });
+    }, 20000);
     if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
     const d=await r.json();
     return d?.choices?.[0]?.message?.content || "";
   });
 }
 
-// Web run that forces JSON with sources
+// Web run that forces JSON with sources, but times out fast
 async function callWeb(model, promptText){
   return withRetry(async () => {
-    const r = await fetch("https://api.openai.com/v1/responses", {
+    const r = await fetchWithTimeout("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -145,11 +152,9 @@ Return JSON with keys "answer" and "sources".
         tool_choice:"auto",
         text: {
           format: {
-            // name is required at this level
             name: "WebAnswer",
             type: "json_schema",
             json_schema: {
-              // strict true makes the model obey the schema
               strict: true,
               schema: {
                 type: "object",
@@ -177,7 +182,7 @@ Return JSON with keys "answer" and "sources".
           }
         }
       })
-    });
+    }, 25000);
 
     if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
     const d = await r.json();
@@ -195,7 +200,7 @@ Return JSON with keys "answer" and "sources".
     }
 
     return { text: sanitizeForSheet(answer), sources: dedupeAndNormalize(sources) };
-  });
+  }, { tries: 2, base: 300, factor: 2 });
 }
 
 // Try to pull textual output from Responses API object
@@ -270,8 +275,9 @@ export default async function handler(req, res){
     const tabBrands=String(settings.sheet_name_brands||"Brands");
     const tabWide=String(settings.sheet_name_wide||"Daily_Runs");
     const enableDual=String(settings.enable_dual_variant||"TRUE").toUpperCase()==="TRUE";
-    const concurrency=Math.max(1, Number(settings.chunk_size||10) || 10);
-    const FLUSH_EVERY = Math.max(5, Number(settings.flush_every||25) || 25);
+
+    // keep it gentle to avoid stalls
+    const concurrency = Math.max(1, Math.min(2, Number(settings.chunk_size||2) || 2));
 
     const [prompts, brands]=await Promise.all([ readPrompts(sheets, tabPrompts), readBrands(sheets, tabBrands) ]);
     if(!prompts.length) return res.status(200).json({ ok:true, message:"No enabled prompts" });
@@ -281,21 +287,24 @@ export default async function handler(req, res){
     const dateKey=todayKey("Africa/Cairo");
     const cols=await getOrCreateDateCols(sheets, tabWide, dateKey, enableDual);
 
-    // batching buffer
-    let pending = [];
-    async function flush(){
-      if (!pending.length) return;
-      const batch = pending.splice(0, pending.length);
+    async function writeRow(row, updates){
+      // updates is an object of { colLabel: value }
+      const data = Object.entries(updates).map(([label, value]) => {
+        const c = cols[label];
+        if (!c) return null;
+        return { range:`${tabWide}!${A1(row, c)}`, values:[[ value ?? "" ]] };
+      }).filter(Boolean);
+      if (!data.length) return;
       await withRetry(async () => {
         await sheets.spreadsheets.values.batchUpdate({
           spreadsheetId:SHEET_ID,
-          requestBody:{ valueInputOption:"RAW", data: batch }
+          requestBody:{ valueInputOption:"RAW", data }
         });
       });
     }
 
-    // pool
-    let i=0, active=0, processed=0, errors=[];
+    // process with small pool and flush per row
+    let i=0, active=0, errors=[];
     const next=()=> i<prompts.length ? i++ : -1;
 
     await new Promise(resolve=>{
@@ -308,8 +317,13 @@ export default async function handler(req, res){
           const normal=await callChat(model, p.text);
           const normalA=analyzeText(normal, brands, brandRegexes);
 
-          let webText="", webSources=[], webA="";
+          await writeRow(row, {
+            [`${dateKey}_results_normal`]: normal,
+            [`${dateKey}_analysis_normal`]: normalA
+          });
+
           if(enableDual){
+            let webText="", webSources=[], webA="";
             try{
               const webOut=await callWeb(model, p.text);
               webText = webOut.text || "";
@@ -319,31 +333,21 @@ export default async function handler(req, res){
               webSources = dedupeAndNormalize(extractUrlsFromText(webText));
             }
             webA=analyzeText(webText, brands, brandRegexes);
-          }
 
-          // queue writes
-          pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_normal`])}`, values:[[normal]] });
-          pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_normal`])}`, values:[[normalA]] });
-          if(enableDual){
-            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_results_web`])}`, values:[[webText]] });
-            pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_analysis_web`])}`, values:[[webA]] });
-            if (cols[`${dateKey}_sources_web`]) {
-              pending.push({ range:`${tabWide}!${A1(row, cols[`${dateKey}_sources_web`])}`, values:[[ (webSources||[]).join("\n") ]] });
-            }
+            await writeRow(row, {
+              [`${dateKey}_results_web`]: webText,
+              [`${dateKey}_analysis_web`]: webA,
+              [`${dateKey}_sources_web`]: (webSources||[]).join("\n")
+            });
           }
-
-          processed++;
-          if (processed % FLUSH_EVERY === 0) { await flush(); }
         } catch(e){ errors.push(String(e)); }
         finally{ active--; runOne(); }
       };
-      const N=Math.max(1, Math.min(concurrency, prompts.length));
-      for(let k=0;k>N;k++) runOne();
+      const N = Math.max(1, Math.min(concurrency, prompts.length));
+      for(let k=0;k<N;k++) runOne();
     });
 
-    await flush();
-
-    res.status(200).json({ ok:true, model, dual:enableDual, prompts:prompts.length, processed, errors });
+    res.status(200).json({ ok:true, model, dual:enableDual, prompts:prompts.length });
   }catch(e){
     console.error(e);
     res.status(500).json({ ok:false, error:String(e) });
