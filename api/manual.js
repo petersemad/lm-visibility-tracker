@@ -38,12 +38,36 @@ function colName(n) { let s=""; while(n>0){const m=(n-1)%26; s=String.fromCharCo
 function todayKey(tz="Africa/Cairo"){ const f=new Intl.DateTimeFormat("en-CA",{timeZone:tz,year:"numeric",month:"2-digit",day:"2-digit"}); return f.format(new Date()); }
 function escRegex(s){ return s.replace(/[\\^$.*+?()[\]{}|]/g,"\\$&"); }
 function sanitizeForSheet(s){ if(!s) return ""; return String(s).replace(/\[([^\]]+)\]\(([^)]+)\)/g,"$1").replace(/\s{2,}/g," ").trim(); }
-function analyzeText(txt, brands, brandRegexes){
-  if(!txt) return "SC=No | Brands=";
-  const sc=/(?:\bSales\s*Captain\b|salescaptain)/i.test(txt);
-  const hits=[]; for(let i=0;i<brandRegexes.length;i++){ const b=brands[i]; if(/^Sales\s*Captain$/i.test(b)) continue; if(brandRegexes[i].test(txt)) hits.push(b); }
-  return `SC=${sc?"Yes":"No"} | Brands=${hits.join(", ")}`;
+function analyzeText(txt, brands, brandRegexes) {
+  if (!txt) return `${SPECIAL_BRAND_KEY}=No | Brands=`;
+
+  // Build a regex for the special brand
+  // Example: "Sales Captain" or "SalesCaptain", or "ThePod.fm"
+  const name = String(SPECIAL_BRAND_NAME).trim();
+  const baseEsc = escRegex(name);
+
+  // Allow both with and without spaces for multi word names
+  const noSpaceEsc = baseEsc.replace(/\\s+/g, "");
+  const specialRe = new RegExp(
+    `(?:\\b${baseEsc}\\b|${noSpaceEsc})`,
+    "i"
+  );
+
+  const hasSpecial = specialRe.test(txt);
+
+  const hits = [];
+  for (let i = 0; i < brandRegexes.length; i++) {
+    const b = String(brands[i] || "");
+    // Skip the special brand in the Brands list
+    const isSpecialBrandRow = new RegExp(`^${baseEsc}$`, "i").test(b);
+    if (isSpecialBrandRow) continue;
+
+    if (brandRegexes[i].test(txt)) hits.push(b);
+  }
+
+  return `${SPECIAL_BRAND_KEY}=${hasSpecial ? "Yes" : "No"} | Brands=${hits.join(", ")}`;
 }
+
 
 /* ===== Google Sheets client ===== */
 async function sheetsClient(){
