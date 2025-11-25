@@ -7,7 +7,9 @@ const {
   GOOGLE_PRIVATE_KEY: RAW_KEY,
   GOOGLE_PRIVATE_KEY_B64,
   SHEET_ID,
-  DEFAULT_MODEL = "gpt-4o"
+  DEFAULT_MODEL = "gpt-4o",
+  SPECIAL_BRAND_NAME = "Sales Captain",
+  SPECIAL_BRAND_KEY = "SC",
 } = process.env;
 
 const GOOGLE_PRIVATE_KEY = GOOGLE_PRIVATE_KEY_B64
@@ -47,8 +49,8 @@ function analyzeText(txt, brands, brandRegexes) {
   const baseEsc = escRegex(name);
 
   // Allow both with and without spaces for multi word names
-  const noSpaceEsc = baseEsc.replace(/\\s+/g, "");
-  const specialRe = new RegExp(
+const noSpaceEsc = baseEsc.replace(/\s+/g, "");
+const specialRe = new RegExp(
     `(?:\\b${baseEsc}\\b|${noSpaceEsc})`,
     "i"
   );
