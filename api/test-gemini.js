@@ -1,4 +1,4 @@
-import { runGemini } from "../lib/runGemini.js"; // adjust path if needed
+import { runGemini } from "../lib/runGemini.js";
 
 export default async function handler(req, res) {
   try {
