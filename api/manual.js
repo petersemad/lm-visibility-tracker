@@ -140,7 +140,7 @@ async function callChat(model, promptText){
       method:"POST",
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
       body:JSON.stringify({
-        model, temperature:0.2,
+        model, 
         messages:[ {role:"system",content:"Answer concisely. Plain text only."}, {role:"user",content:promptText} ]
       })
     });
@@ -156,7 +156,7 @@ async function callWeb(model, promptText){
       headers:{ "Authorization":`Bearer ${OPENAI_API_KEY}`, "Content-Type":"application/json" },
       body:JSON.stringify({
         model, input:promptText, tools:[{type:"web_search"}],
-        temperature:0.2, text:{ format:{type:"text"}, verbosity:"medium" }, tool_choice:"auto"
+        text:{ format:{type:"text"}, verbosity:"medium" }, tool_choice:"auto"
       })
     });
     if(!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
