@@ -122,7 +122,6 @@ async function callChat(model, promptText) {
     headers: { "Authorization": `Bearer ${OPENAI_API_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      temperature: 0.2,
       messages: [
         { role: "system", content: "Answer concisely. Plain text only." },
         { role: "user", content: promptText }
@@ -141,7 +140,6 @@ async function callWeb(model, promptText) {
       model,
       input: promptText,
       tools: [{ type: "web_search" }],
-      temperature: 0.2,
       text: { format: { type: "text" }, verbosity: "medium" },
       tool_choice: "auto"
     })
